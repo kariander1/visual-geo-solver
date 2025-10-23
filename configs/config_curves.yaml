@@ -1,0 +1,113 @@
+hydra:
+  run:
+    dir: outputs/${now:%Y-%m-%d_%H-%M-%S-%f}
+
+defaults:
+  - _self_
+
+
+float32_matmul_precision: 'high'
+compile_model: true
+save_git_diff: true
+
+# Dataset configuration
+dataset:
+  type: "curves"
+  use_distance_transform: false
+  use_signed_distance_transform: false
+  fill_square: true
+  num_samples: 100000
+  save_on_generate: false
+  dataset_path: "data/curves_data"
+  image_size: 128
+  val_fraction: 0.1
+  side_length_range: [0.3, 0.7]
+  H_range: [6, 30]
+  shift_range: 0.5
+  max_squares: 5  # maximum number of squares to generate
+  num_points: 500
+  circles_ratio: 0.1
+  curve_kwargs:
+    thickness_range: [1]
+  ellipse_kwargs:
+    thickness: 1
+  square_kwargs:
+    thickness: 1
+    fill_shape: false
+
+model:
+  time_emb_dim: 128
+  num_levels: 4
+  attention_heads: 8
+  attention_locations: ["bottleneck", "enc2", "enc3", "dec2", "dec3"]
+  base_channels: 64
+
+metrics:
+  quality:
+    type: "squareness"
+
+  alignment:
+    decay_scale: 7.5
+
+# Training configuration
+train:
+  autocast_dtype: 'bfloat16'
+  clip_grad_norm: true
+  checkpoint_path: ''
+  num_workers: 2
+  persistent_workers: true
+  optimizer_config:
+    type: "adamw"
+    params:
+      lr: 6e-4
+      fused: true
+
+  loss_config:
+    loss_func: "l2"
+    loss_target: "eps"
+    piecewise_loss: false
+    weight_x_0_by_timestep: false 
+  lr_scheduler_config:
+    num_cycles: 0.5
+    num_warmup_steps: 100
+    min_lr_factor: 0.1
+  
+  grad_accum_steps: 4
+  batch_size: 256
+  num_epochs: 1000
+  seed: 42
+  p_null: 0
+  clean_prev_checkpoints: true
+  checkpoint_every_n_epochs: 5
+  validation_config:
+    validate_every_n_epochs: 2
+    n_samples_for_metrics: 1000
+    guidance_scale: 1.0
+    seed: ${train.seed}
+  sampling_config:
+    sample_every_n_epochs: 2
+    n_samples: 4
+    n_seeds_per_sample: 4
+    guidance_scale: [1]
+    seed: ${train.seed}
+    timesteps_to_log: [99, 95, 90, 80, 50, 20, 10, 1]  # timesteps to log during validation
+    log_to_wandb: true
+
+  log_every_n_steps: 10
+  train_viz_config:   
+    plot_every_n_steps: 1000
+    num_samples_to_plot: 4
+    
+  null_condition: 0
+
+# Diffusion scheduler configuration
+scheduler:
+  diffusion_steps: 100
+  eta: 0.0
+  
+# Wandb config (optional empty dict or override as needed)
+wandb:
+  project: "geometric-solver-curves"
+  entity: "entity"  # fill if needed
+  mode: "offline"  # options: online, offline, disabled
+  api_key: "key" # fill if needed
