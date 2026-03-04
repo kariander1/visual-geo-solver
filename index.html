@@ -40,13 +40,14 @@
 <body>
 
 
+<!-- ==================== Hero ==================== -->
 <section class="hero">
   <div class="hero-body">
     <div class="container is-max-desktop">
       <div class="columns is-centered">
         <div class="column has-text-centered">
           <h1 class="title is-1 publication-title">Visual Diffusion Models are Geometric Solvers</h1>
-          
+
 
           <div class="is-size-5 publication-authors">
             <span class="author-block">
@@ -79,7 +80,7 @@
 </div>
           <br>
           <div>
-            <h1 class="title"></h1>
+            <h1 class="title">CVPR 2026</h1>
           </div>
           <br>
 
@@ -114,6 +115,202 @@
 </section>
 
 
+<!-- ==================== Teaser ==================== -->
+<section class="hero teaser">
+  <div class="container is-max-desktop">
+    <div class="hero-body">
+      <h2 class="subtitle has-text-centered">
+        We show that visual diffusion models, trained solely on 2D image representations
+        of geometric problems, can effectively solve classical computational geometry tasks
+        &mdash; including the <b>Inscribed Square Problem</b>, <b>Steiner Tree Problem</b>,
+        and the <b>Maximum Area Polygon Problem</b>.
+      </h2>
+      <img src="./static/images/teaser.jpg" alt="Teaser figure showing visual diffusion models solving geometric problems." class="teaser-img" />
+    </div>
+  </div>
+</section>
+
+
+<!-- ==================== Abstract ==================== -->
+<section class="section">
+  <div class="container is-max-desktop">
+    <div class="columns is-centered has-text-centered">
+      <div class="column is-four-fifths">
+        <h2 class="title is-3">Abstract</h2>
+        <div class="content has-text-justified">
+          <p>
+            In this paper we show that visual diffusion models can
+            serve as effective geometric solvers: they can directly reason about geometric
+            problems by working in pixel space.
+            We first demonstrate this on the Inscribed Square Problem,
+            a long-standing problem in geometry that asks whether every Jordan curve contains
+            four points forming a square. We then extend the approach to two other well-known
+            hard geometric problems: the Steiner Tree Problem and the Simple Polygon Problem.
+          </p>
+          <p>
+            Our method treats each problem instance as an image and trains a standard visual
+            diffusion model that transforms Gaussian noise into an image representing a valid
+            approximate solution that closely matches the exact one. The model learns to
+            transform noisy geometric structures into correct configurations, effectively
+            recasting geometric reasoning as image generation.
+          </p>
+          <p>
+            Unlike prior work that necessitates specialized architectures and domain-specific
+            adaptations when applying diffusion to parametric geometric representations, we
+            employ a standard visual diffusion model that operates on the visual representation
+            of the problem. This simplicity highlights a surprising bridge between generative
+            modeling and geometric problem solving.
+          </p>
+          <p>
+            Beyond the specific problems studied here, our results point toward a broader
+            paradigm: operating in image space provides a general and practical framework for
+            approximating notoriously hard problems, and opens the door to tackling a far wider
+            class of challenging geometric tasks.
+          </p>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+
+<!-- ==================== Method ==================== -->
+<section class="section">
+  <div class="container is-max-desktop">
+    <div class="columns is-centered has-text-centered">
+      <div class="column is-four-fifths">
+        <h2 class="title is-3">Method</h2>
+      </div>
+    </div>
+    <div class="columns is-centered">
+      <div class="column is-four-fifths">
+        <div class="content has-text-justified">
+          <p>
+            Our approach is based on a simple idea: <b>reformulate classical geometric problems as
+            conditional image generation tasks</b>. Given a problem instance (e.g., a closed curve, a set
+            of terminal points), we encode it as a binary image and train a diffusion model to generate
+            the corresponding solution image.
+          </p>
+          <p>
+            Each geometric problem instance is represented visually: a rasterized curve
+            or a set of points. A conditional UNet-based diffusion model
+            takes this image as input, concatenated with noise, and iteratively denoises
+            it into a solution image. The same architecture is used across all three tasks
+            &mdash; only the training data changes.
+          </p>
+          <p>
+            The generated image is then decoded back into the geometric domain through
+            simple post-processing to recover the symbolic solution structure.
+          </p>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+
+<!-- ==================== Results ==================== -->
+<section class="section">
+  <div class="container is-max-desktop">
+    <div class="columns is-centered has-text-centered">
+      <div class="column is-four-fifths">
+        <h2 class="title is-3">Results</h2>
+        <div class="content has-text-justified">
+          <p>
+            We evaluate our approach on three classical problems. In each case, the same UNet architecture and diffusion
+            framework is applied &mdash; only the training data changes.
+          </p>
+        </div>
+      </div>
+    </div>
+
+    <!-- Inscribed Square Problem -->
+    <div class="columns is-centered">
+      <div class="column is-four-fifths">
+        <h3 class="title is-4">Inscribed Square Problem</h3>
+        <img src="./static/images/isp_example.jpg"
+             alt="A closed curve with multiple inscribed squares."
+             style="width: 60%; display: block; margin: 0 auto 1rem auto;" />
+        <div class="content has-text-justified">
+          <p>
+            Toeplitz (1911) conjectured that every simple closed curve contains an inscribed
+            square. We render each curve as a binary image (condition) and train the model to
+            generate the corresponding inscribed square image (solution). Different random
+            seeds yield diverse valid squares on the same curve.
+          </p>
+        </div>
+        <img src="./static/images/isp_trajectory.jpg"
+             alt="Inscribed Square Problem: denoising trajectory from noise to predicted inscribed squares across multiple seeds."
+             style="width: 100%;" />
+      </div>
+    </div>
+
+    <!-- Steiner Tree Problem -->
+    <div class="columns is-centered" style="margin-top: 1.5rem;">
+      <div class="column is-four-fifths">
+        <h3 class="title is-4">Steiner Tree Problem</h3>
+        <img src="./static/images/steiner_example.jpg"
+             alt="Steiner Tree Problem: terminal points (left) and the optimal Steiner tree connecting them (right)."
+             style="width: 70%; display: block; margin: 0 auto 1rem auto;" />
+        <div class="content has-text-justified">
+          <p>
+            The Euclidean Steiner Tree Problem asks for the shortest network connecting a
+            set of terminal points. Using the exact same architecture and training paradigm,
+            we render terminal locations as the condition image and optimal Steiner trees
+            as solution images. The model learns to place Steiner points and edges
+            from visual examples alone.
+          </p>
+        </div>
+        <img src="./static/images/steiner_trajectory.jpg"
+             alt="Steiner Tree Problem: denoising trajectory from noise to predicted Steiner trees across multiple seeds."
+             style="width: 100%;" />
+      </div>
+    </div>
+
+    <!-- Maximum Area Polygon Problem -->
+    <div class="columns is-centered" style="margin-top: 1.5rem;">
+      <div class="column is-four-fifths">
+        <h3 class="title is-4">Maximum Area Polygon Problem</h3>
+        <img src="./static/images/polygon_example.jpg"
+             alt="Maximum Area Polygon Problem: a set of points and the maximum-area simple polygon through them."
+             style="width: 70%; display: block; margin: 0 auto 1rem auto;" />
+        <div class="content has-text-justified">
+          <p>
+            Given a set of points, find the simple polygon through all of them with the
+            largest possible area &mdash; an NP-hard optimization problem. Again with the
+            same model and paradigm, point locations are rendered as the condition and
+            optimal maximum-area polygons as the solution. The model produces diverse
+            polygon shapes from the same point set across different seeds.
+          </p>
+        </div>
+        <img src="./static/images/polygon_trajectory.jpg"
+             alt="Maximum Area Polygon Problem: denoising trajectory from noise to predicted polygons across multiple seeds."
+             style="width: 100%;" />
+      </div>
+    </div>
+
+  </div>
+</section>
+
+
+<!-- ==================== BibTeX ==================== -->
+<section class="section" id="BibTeX">
+  <div class="container is-max-desktop content">
+    <h2 class="title">BibTeX</h2>
+    <pre><code>@misc{goren2025visualdiffusionmodelsgeometric,
+      title={Visual Diffusion Models are Geometric Solvers},
+      author={Nir Goren and Shai Yehezkel and Omer Dahary and Andrey Voynov and Or Patashnik and Daniel Cohen-Or},
+      year={2025},
+      eprint={2510.21697},
+      archivePrefix={arXiv},
+      primaryClass={cs.CV},
+      url={https://arxiv.org/abs/2510.21697},
+}</code></pre>
+  </div>
+</section>
+
+
+<!-- ==================== Footer ==================== -->
 <footer class="footer">
   <div class="container">
     <div class="content has-text-centered">
@@ -133,4 +330,3 @@
 </body>
 
 </html>
-
