@@ -1,9 +1,12 @@
 import os
+import sys
+from pathlib import Path as _Path
+
+_ROOT = _Path(__file__).resolve().parents[1]
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
 from loguru import logger
-logger.info(
-    "Environment Variables:\n" +
-    "\n".join(f"{k}={v}" for k, v in os.environ.items())
-)
 import torch
 import torch.optim as optim
 import hydra
@@ -77,7 +80,7 @@ def main(config: DictConfig):
         ddp_local_rank = 0
         ddp_world_size = 1
         master_process = True
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+        device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
         logger.info(f"Using device: {device}")
     
     if master_process:
@@ -136,7 +139,7 @@ def main(config: DictConfig):
         shuffle=(train_sampler is None),  # only shuffle if not using DistributedSampler
         num_workers=safe_num_workers,
         persistent_workers=config['train'].get('persistent_workers', True) if safe_num_workers > 0 else False,
-        pin_memory=True if safe_num_workers > 0 else False,
+        pin_memory=True if safe_num_workers > 0 and device != 'mps' else False,
         multiprocessing_context='spawn' if safe_num_workers > 0 else None,
     )
 
@@ -147,7 +150,7 @@ def main(config: DictConfig):
         shuffle=False,
         num_workers=safe_num_workers,
         persistent_workers=config['train'].get('persistent_workers', True) if safe_num_workers > 0 else False,
-        pin_memory=True if safe_num_workers > 0 else False,
+        pin_memory=True if safe_num_workers > 0 and device != 'mps' else False,
         multiprocessing_context='spawn' if safe_num_workers > 0 else None,
     )
 
@@ -157,7 +160,10 @@ def main(config: DictConfig):
         )
     logger.info(f"Model parameters: {sum(p.numel() for p in model.parameters())}")
     if config['compile_model']:
-        model = torch.compile(model)
+        if device == 'mps':
+            logger.warning("torch.compile not supported on MPS, skipping")
+        else:
+            model = torch.compile(model)
 
     # Load checkpoint before DDP
     if os.path.exists(model_path):
@@ -177,7 +183,11 @@ def main(config: DictConfig):
     if config['train']['optimizer_config']['type'] == 'adam':
         optimizer = optim.Adam(model.parameters(), **config['train']['optimizer_config']['params'])
     elif config['train']['optimizer_config']['type'] == 'adamw':
-        optimizer = optim.AdamW(model.parameters(), **config['train']['optimizer_config']['params'])
+        opt_params = dict(config['train']['optimizer_config']['params'])
+        if device == 'mps' and opt_params.get('fused', False):
+            logger.warning("Fused optimizer not supported on MPS, disabling")
+            opt_params.pop('fused', None)
+        optimizer = optim.AdamW(model.parameters(), **opt_params)
     else:
         raise ValueError(f"Unsupported optimizer: {config['train']['optimizer_config']['type']}")
     
@@ -212,7 +222,12 @@ def main(config: DictConfig):
             **config['train'])
     else:
         # Diffusion training
-        scheduler = DDIM(device=device, **config['scheduler'])
+        scheduler_type = config.get('scheduler_type', 'ddim')
+        if scheduler_type == 'flow_matching':
+            from schedulers.flow_matching import FlowMatching
+            scheduler = FlowMatching(device=device, **config['scheduler'])
+        else:
+            scheduler = DDIM(device=device, **config['scheduler'])
         train_img_diffusion_model(
             config,
             model,

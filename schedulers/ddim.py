@@ -1,4 +1,5 @@
 import torch
+import numpy as np
 from tqdm import tqdm
 
 class DDIM:
@@ -18,6 +19,87 @@ class DDIM:
         self.alphas = 1 - self.betas
         self.eta  = eta
         self.device = device
+
+    def _get_sampling_timesteps(self, sampling_steps, sampling_schedule):
+        """Build a list of timesteps for the sampling loop.
+
+        Args:
+            sampling_steps: total number of denoising steps (None → use all).
+            sampling_schedule: one of
+                "uniform"  – evenly spaced across the full range
+                "first_last:F,L" – keep the first F high-noise steps and last L
+                                   low-noise steps, skip the middle.
+                "cosine"   – cosine-spaced (denser at both ends)
+                "cosine_head" – cosine-spaced, denser at the start (high noise)
+                "cosine_tail" – cosine-spaced, denser at the end (low noise)
+                "quadratic" – quadratic spacing (denser at start)
+        Returns:
+            List[int] of timesteps in descending order (high → low noise),
+            ending at 1 (the final denoise to t=0 is implicit).
+        """
+        full = list(range(self.diffusion_steps - 1, 0, -1))  # [T-1, T-2, ..., 1]
+        N = len(full)
+
+        if sampling_steps is None or sampling_steps >= N:
+            return full
+
+        if sampling_schedule.startswith("first_mid_last"):
+            # "first_mid_last:F,M,L" – F from start, M uniform from middle, L from end
+            parts = sampling_schedule.split(":")
+            first, mid, last = [int(x) for x in parts[1].split(",")]
+            first = min(first, N)
+            last = min(last, N - first)
+            head = full[:first]
+            tail = full[-last:] if last > 0 else []
+            # middle: uniform sample from the gap between head and tail
+            mid_start = first
+            mid_end = N - last
+            if mid > 0 and mid_end > mid_start:
+                mid_indices = np.linspace(mid_start, mid_end - 1, mid, dtype=int)
+                middle = [full[i] for i in mid_indices]
+            else:
+                middle = []
+            return head + middle + tail
+        elif sampling_schedule.startswith("first_last"):
+            parts = sampling_schedule.split(":")
+            if len(parts) == 2:
+                first, last = [int(x) for x in parts[1].split(",")]
+            else:
+                # Default split: roughly 60/40
+                first = int(sampling_steps * 0.6)
+                last = sampling_steps - first
+            first = min(first, N)
+            last = min(last, N - first)
+            head = full[:first]
+            tail = full[-last:] if last > 0 else []
+            return head + tail
+        elif sampling_schedule == "cosine":
+            # Cosine spacing: denser at both ends (0 and pi)
+            t = np.linspace(0, np.pi, sampling_steps)
+            indices = np.round((1 - np.cos(t)) / 2 * (N - 1)).astype(int)
+            indices = np.unique(np.clip(indices, 0, N - 1))
+            return [full[i] for i in indices]
+        elif sampling_schedule == "cosine_head":
+            # Denser at start (high noise): use first half of cosine curve
+            t = np.linspace(0, np.pi / 2, sampling_steps)
+            indices = np.round((1 - np.cos(t)) * (N - 1)).astype(int)
+            indices = np.unique(np.clip(indices, 0, N - 1))
+            return [full[i] for i in indices]
+        elif sampling_schedule == "cosine_tail":
+            # Denser at end (low noise): mirror of cosine_head
+            t = np.linspace(0, np.pi / 2, sampling_steps)
+            indices = np.round(np.sin(t) * (N - 1)).astype(int)
+            indices = np.unique(np.clip(indices, 0, N - 1))
+            return [full[i] for i in indices]
+        elif sampling_schedule == "quadratic":
+            # Quadratic: denser at start (high noise)
+            t = np.linspace(0, 1, sampling_steps)
+            indices = np.round(t**2 * (N - 1)).astype(int)
+            indices = np.unique(np.clip(indices, 0, N - 1))
+            return [full[i] for i in indices]
+        else:  # "uniform"
+            indices = np.linspace(0, N - 1, sampling_steps, dtype=int)
+            return [full[i] for i in indices]
         
     def noise(self, x_0: torch.Tensor, t: torch.Tensor):
         eps = torch.randn(size=x_0.shape, device=x_0.device)
@@ -57,7 +139,7 @@ class DDIM:
         return x_t_prev, x_0_pred, x_t_scaled, noise_pred_scaled
 
     
-    def sample(self, model, n_samples=1000, n_features=9, condition: torch.Tensor=0, guidance_scale=1, x_T=None, seed=None, return_dict=True, index_in=[], source_distribution=None, index_out=[]):
+    def sample(self, model, n_samples=1000, n_features=9, condition: torch.Tensor=0, guidance_scale=1, x_T=None, seed=None, return_dict=True, index_in=[], source_distribution=None, index_out=[], sampling_steps=None, sampling_schedule="uniform"):
         """Sampler following the Denoising Diffusion Probabilistic Models method by Ho et al (Algorithm 2)"""
         with torch.no_grad():
             if x_T is None:
@@ -85,7 +167,7 @@ class DDIM:
                         # Create a mask for the indices to keep
                         mask = torch.ones(x_t.size(0), dtype=torch.bool, device=x_t.device)
                         mask[index_out] = False  # Mark indices in index_out as False
-                        
+
                         # Use the mask to filter x_t
                         x_t = x_t[mask]
                         n_samples = x_t.shape[0]
@@ -94,6 +176,10 @@ class DDIM:
             else:
                 x_t = x_T
                 n_samples = x_T.shape[0]
+
+            # Build timestep schedule (may be a subset for faster sampling)
+            timestep_list = self._get_sampling_timesteps(sampling_steps, sampling_schedule)
+
             x_t_traj = [x_t]
             x_0_traj = []
             x_t_scaled_traj = []
@@ -101,7 +187,14 @@ class DDIM:
             noise_pred_traj = []
             noise_pred_scaled_traj = []
             noise_pred_cond_traj = []
-            for t in tqdm(range(self.diffusion_steps-1, 0, -1)):
+            total_steps = len(timestep_list)
+            for step_idx, t in enumerate(tqdm(timestep_list, desc=f"Sampling ({total_steps} steps)", unit="step")):
+                # prev_timestep: next entry in schedule, or 0 for the last step
+                if step_idx + 1 < len(timestep_list):
+                    prev_t = timestep_list[step_idx + 1]
+                else:
+                    prev_t = 0
+
                 t_tensor = torch.full([n_samples, 1], t, device=self.device)
 
                 # Ensure condition is on the correct device
@@ -126,16 +219,16 @@ class DDIM:
 
                 null_tensor = torch.full_like(c_tensor, 0, device=self.device)
 
-                
+
                 noise_pred_conditional = model(x_t, t_tensor, c_tensor)
                 # Apply classifier-free guidance
                 if guidance_scale != 1:
                     noise_pred_unconditional = model(x_t, t_tensor, null_tensor)
                     noise_pred = noise_pred_unconditional + guidance_scale * (noise_pred_conditional - noise_pred_unconditional)
-                    x_t, x_0_hat, x_t_scaled, noise_pred_scaled = self.denoise_ddim(x_t, t, noise_pred, noise_pred_uncond=noise_pred_unconditional)
+                    x_t, x_0_hat, x_t_scaled, noise_pred_scaled = self.denoise_ddim(x_t, t, noise_pred, prev_timestep=prev_t, noise_pred_uncond=noise_pred_unconditional)
                 else:
                     noise_pred = noise_pred_conditional
-                    x_t, x_0_hat, x_t_scaled, noise_pred_scaled = self.denoise_ddim(x_t, t, noise_pred)
+                    x_t, x_0_hat, x_t_scaled, noise_pred_scaled = self.denoise_ddim(x_t, t, noise_pred, prev_timestep=prev_t)
 
                 guidance_scale_traj+= [torch.full([n_samples, 1], guidance_scale, device=self.device)]
                 x_0_traj += [x_0_hat]

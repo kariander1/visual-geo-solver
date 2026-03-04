@@ -2,438 +2,634 @@
 import sys
 from pathlib import Path as _Path
 
-# Ensure project root is on sys.path so absolute imports like `utils.*` work
-# when running this file directly (e.g., `uv run scripts/evaluate_steiner.py`).
+# Ensure project root is on sys.path so absolute imports work
 _ROOT = _Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
+import os
+import argparse
 import numpy as np
 import torch
-import matplotlib.patches as patches
-
-import numpy as np
-import torch
-import matplotlib.pyplot as plt
-import numpy as np
-import torch
-import matplotlib.pyplot as plt
 from tqdm import tqdm
-from utils.dataloader import get_dataset
-from data.Curves import CurveImageDataset
-import cv2
-import torch
-import numpy as np
-
-from utils.config_handler import remove_weight_prefixes
-from scipy.ndimage import binary_erosion
-
-from model.diffusion import UNet
-from schedulers.ddim import DDIM
-import matplotlib.pyplot as plt
-from scipy.ndimage import binary_dilation
+from scipy.ndimage import distance_transform_edt
 from torch.utils.data import DataLoader, random_split
 
+from utils.dataloader import get_dataset
+from utils.config_handler import remove_weight_prefixes
+from model.diffusion import UNet
 
-def _to_numpy01(img):
-    if isinstance(img, torch.Tensor):
-        img = img.detach().cpu().numpy()
-    if img.ndim == 3 and img.shape[0] == 1:
-        img = img[0]
-    return (img < 0)   # threshold at 0
+# Reuse geometry helpers from eval_squares
+from scripts.eval_squares import (
+    _to_numpy01,
+    _to_numpy255,
+    get_box,
+    squareness_metric,
+    snap_square_by_rigid_transform,
+    compute_alignment_score_from_box,
+    _largest_component_pts,
+    _min_area_rect,
+    _box_points,
+)
 
 
-def get_mask_edge(square_binary: np.ndarray, thickness: int = 1) -> np.ndarray:
-    sb = square_binary.astype(bool)
-    eroded = binary_erosion(sb)
-    base_edge = sb & (~eroded)          # 1-px edge
-    dilated = binary_dilation(base_edge, iterations=thickness-1)
-    return dilated
+# ---------------------------------------------------------------------------
+# Coordinate conversion
+# ---------------------------------------------------------------------------
+
+def parametric_to_pixel(pts, image_size):
+    """Convert normalised [-1, 1] coordinates to pixel coordinates."""
+    return pts * (image_size // 2) + image_size // 2
 
 
-def _to_numpy255(img):
-    return (_to_numpy01(img) * 255).astype(np.uint8)
+# ---------------------------------------------------------------------------
+# True parametric helpers (no discretisation)
+# ---------------------------------------------------------------------------
 
-def compute_alignment_score_from_box(box, square_mask, dist_transform, decay_scale=7.5):
-    """
-    Computes alignment score between box corners and curve using distance transform.
+def point_to_polyline_distance(point, polyline):
+    """Minimum distance from a point to a closed polyline.
 
     Args:
-        box (np.ndarray): 4x2 array of box corners (float or int)
-        square_mask (np.ndarray): binary mask from which to find closest real pixels
-        dist_transform (np.ndarray): precomputed distance transform from curve mask
-        decay_scale (float): decay factor for exponential decay
+        point: (2,) array.
+        polyline: (N, 2) array — vertices of a closed polyline.
 
     Returns:
-        float: alignment score (higher is better)
-        list: list of distances used for scoring
-        list: list of (x, y) points sampled in the mask
+        float: minimum Euclidean distance.
     """
-    if not np.any(square_mask):
-        return 0.0, [], []
+    p1 = polyline                          # (N, 2)
+    p2 = np.roll(polyline, -1, axis=0)     # (N, 2)
 
-    # Extract foreground mask points
-    mask_pts = np.column_stack(np.where(square_mask > 0))[:, [1, 0]]  # (x, y) format
+    d = p2 - p1                            # segment vectors
+    f = point - p1                          # vectors from p1 to query
 
-    distances = []
-    sampled_points = []
-    for corner in box:
-        dists = np.linalg.norm(mask_pts - corner, axis=1)
-        closest = mask_pts[np.argmin(dists)]
-        x, y = int(closest[0]), int(closest[1])
-        distances.append(dist_transform[y, x])
-        sampled_points.append((x, y))
+    dd = np.sum(d * d, axis=1)             # |segment|²
+    t = np.sum(f * d, axis=1) / (dd + 1e-12)
+    t = np.clip(t, 0, 1)
 
-    avg_dist = np.mean(distances)
-    # score = float(np.exp(-avg_dist / decay_scale))
-    score = -avg_dist
+    closest = p1 + t[:, None] * d
+    dists = np.linalg.norm(point - closest, axis=1)
+    return float(np.min(dists))
 
-    return score, distances, sampled_points, avg_dist
 
-import numpy as np
+def alignment_parametric(corners, curve_pts):
+    """Mean min-distance from 4 corners to a continuous curve polyline.
+
+    Both inputs should be in the same coordinate space (either normalised
+    or pixel — doesn't matter as long as they match).
+
+    Returns:
+        float: mean distance in the given coordinate units.
+    """
+    dists = [point_to_polyline_distance(c, curve_pts) for c in corners]
+    return float(np.mean(dists))
+
+
 import cv2
-import argparse
 
 
+def squareness_continuous(corners):
+    """Squareness metric from the paper, computed on float corner coordinates.
 
-def squareness_metric_4_polygon_fit(mask: np.ndarray) -> float:
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        return 0.0
-
-    cnt = max(contours, key=cv2.contourArea)
-
-    # Try polygon approximation first
-    epsilon = 0.02 * cv2.arcLength(cnt, True)  # tolerance = 2% of perimeter
-    approx = cv2.approxPolyDP(cnt, epsilon, True)
-
-    if len(approx) == 4:
-        # Found a quadrilateral
-        box = approx.reshape(-1, 2)
-        rect_area = cv2.contourArea(box)
-    else:
-        # Fallback to minAreaRect
-        rect = cv2.minAreaRect(cnt)
-        (w, h) = rect[1]
-        if w == 0 or h == 0:
-            return 0.0
-        box = cv2.boxPoints(rect)
-        rect_area = w * h
-
-    # Compute overlap: area of mask vs area of polygon
-    mask_area = cv2.contourArea(cnt)
-    ratio = mask_area / rect_area if rect_area > 0 else 0
-
-    # Aspect ratio penalty
-    if len(approx) == 4:
-        # For quadrilateral: compute side lengths
-        edges = [np.linalg.norm(box[i] - box[(i+1)%4]) for i in range(4)]
-        aspect = max(edges) / min(edges) if min(edges) > 0 else np.inf
-    else:
-        # Fallback: use rect sides
-        (w, h) = rect[1]
-        aspect = max(w, h) / min(w, h) if min(w, h) > 0 else np.inf
-
-    penalty = np.exp(-abs(aspect - 1) * 2)
-
-    return float(ratio * penalty)
-
-
-def squareness_metric_moments(mask: np.ndarray) -> float:
-    """
-    Compute a rotation- and translation-invariant squareness score
-    based on the second-order central image moments.
+    Q(S) = (area / (w*h)) * exp(-2 * |max(w,h)/min(w,h) - 1|)
 
     Args:
-        mask (np.ndarray): Binary mask (nonzero pixels = shape)
+        corners: (4, 2) float array.
 
     Returns:
-        float: Squareness score in [0,1], where 1 = perfect square/circle.
+        float: squareness score in [0, 1].  1 = perfect square.
     """
-    # Compute raw image moments
-    M = cv2.moments(mask, binaryImage=True)
-    if M["m00"] == 0:  # empty mask
+    # Area via shoelace
+    x, y = corners[:, 0], corners[:, 1]
+    A = 0.5 * abs(float(np.sum(x * np.roll(y, -1) - np.roll(x, -1) * y)))
+    # Min-area bounding rect
+    rect = cv2.minAreaRect(corners.astype(np.float32))
+    w, h = rect[1]
+    if w * h == 0 or min(w, h) == 0:
         return 0.0
-
-    # Normalize second-order central moments -> covariance of shape
-    mu20 = M["mu20"] / M["m00"]
-    mu02 = M["mu02"] / M["m00"]
-    mu11 = M["mu11"] / M["m00"]
-    cov = np.array([[mu20, mu11], [mu11, mu02]])
-
-    # Eigenvalues = variances along principal axes
-    eigvals, _ = np.linalg.eigh(cov)
-    if np.min(eigvals) <= 0:
-        return 0.0
-
-    ratio = eigvals.max() / eigvals.min()
-
-    # Squareness penalty: 1 if ratio=1, decays as ratio moves away from 1
-    score = np.exp(-2 * abs(ratio - 1))
-
-    return float(score)
-
-def squareness_metric(mask: np.ndarray) -> float:
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        return 0.0
-    
-    cnt = max(contours, key=cv2.contourArea)
-
-    # Compute min area rectangle (rotation invariant)
-    rect = cv2.minAreaRect(cnt)
-    (w, h) = rect[1]
-    if w == 0 or h == 0:
-        return 0.0
-    
-    area = cv2.contourArea(cnt)
-    rect_area = w * h
-    ratio = area / rect_area
-    
-    # Aspect ratio penalty
+    fill = A / (w * h)
     aspect = max(w, h) / min(w, h)
-    penalty = np.exp(-abs(aspect - 1)*2)
-    
-    return float(ratio * penalty)
+    return float(fill * np.exp(-2 * abs(aspect - 1)))
 
-    
-def snap_square_by_rigid_transform(
-    square_mask, curve_mask,
-    angle_range=(-15, 15), angle_step=0.5,
-    trans_step=2, trans_range=5,
-    lambda_reg: float = 0.0,
-):
+
+# ---------------------------------------------------------------------------
+# Bilinear DT helpers (semi-parametric — still uses rasterised DT)
+# ---------------------------------------------------------------------------
+
+def _bilinear_interp(img, x, y):
+    """Bilinear interpolation of *img* at float coordinates (x, y)."""
+    x = np.asarray(x, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64)
+    H, W = img.shape
+    x = np.clip(x, 0, W - 1)
+    y = np.clip(y, 0, H - 1)
+    x0 = np.floor(x).astype(int)
+    y0 = np.floor(y).astype(int)
+    x1 = np.minimum(x0 + 1, W - 1)
+    y1 = np.minimum(y0 + 1, H - 1)
+    dx = x - x0
+    dy = y - y0
+    return (img[y0, x0] * (1 - dx) * (1 - dy) +
+            img[y0, x1] * dx * (1 - dy) +
+            img[y1, x0] * (1 - dx) * dy +
+            img[y1, x1] * dx * dy)
+
+
+def alignment_bilinear_dt(corners, dist_transform):
+    """Mean bilinear-interpolated DT value at 4 float corners."""
+    dists = _bilinear_interp(dist_transform, corners[:, 0], corners[:, 1])
+    return float(np.mean(dists))
+
+
+def alignment_pixel(corners, dist_transform):
+    """Integer-rounded DT lookup at 4 corners (pixel-space alignment)."""
+    H, W = dist_transform.shape
+    ix = np.clip(np.rint(corners[:, 0]).astype(int), 0, W - 1)
+    iy = np.clip(np.rint(corners[:, 1]).astype(int), 0, H - 1)
+    return float(dist_transform[iy, ix].mean())
+
+
+# ---------------------------------------------------------------------------
+# Parametric snap (operates on float corners against the continuous curve)
+# ---------------------------------------------------------------------------
+
+def snap_parametric(corners, curve_pts_px, n_candidates=40000,
+                    angle_range=(-15, 15), trans_range=12, rng=None):
+    """Parametric snap: search over random rigid transforms.
+
+    Score = –mean(nearest-vertex distance) for each candidate.
+    Uses KDTree for fast nearest-vertex lookup to rank candidates,
+    then returns exact polyline alignment for the best one.
+
+    Args:
+        corners: (4, 2) float array — corner positions in pixel coords.
+        curve_pts_px: (N, 2) float array — curve polyline in pixel coords.
+        n_candidates: number of random (angle, dx, dy) to try.
+        angle_range: (min_deg, max_deg).
+        trans_range: max absolute translation in pixels.
+        rng: numpy Generator.
+
+    Returns:
+        best_corners: (4, 2) float array.
+        best_score: float (negative mean distance; higher = better).
     """
-    Snap the square to the curve using rotation + translation (rigid transform),
-    with a single penalization parameter lambda_reg for larger transforms:
-        penalty = lambda_reg * ( ||t||^2 + (L * theta)^2 )
-    where theta is in radians and L is half the square's diagonal (in pixels).
-    """
-    square_mask = _to_numpy255(square_mask)
-    curve_mask  = _to_numpy255(curve_mask)
-    h, w = square_mask.shape
-    if not np.any(square_mask):
-        return square_mask.copy()
+    from scipy.spatial import cKDTree
 
-    # --- Distance transform from the curve (fixed) ---
-    dist_transform = cv2.distanceTransform(255 - curve_mask, cv2.DIST_L2, 5)
+    if rng is None:
+        rng = np.random.default_rng()
 
-    # --- Compute square center & characteristic length L from original mask ---
-    ys, xs = np.where(square_mask > 0)
-    center = np.mean(np.stack([xs, ys], axis=1), axis=0)  # (cx, cy)
+    cx, cy = corners.mean(axis=0)
 
-    # Get the square's side estimate from min-area rect of the original mask
-    contours, _ = cv2.findContours(square_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if contours:
-        cnt0 = max(contours, key=cv2.contourArea)
-        rect0 = cv2.minAreaRect(cnt0)       # ((cx, cy), (w_side, h_side), angle)
-        (w_side, h_side) = rect0[1]
-        s = 0.5 * (w_side + h_side)         # average side length estimate
-        # Half the diagonal:
-        L = (s * np.sqrt(2)) / 2.0 if s > 0 else 1.0
-    else:
-        # Fallback: infer s from area (assuming roughly square)
-        area = float(np.count_nonzero(square_mask))
-        s = np.sqrt(area) if area > 0 else 1.0
-        L = (s * np.sqrt(2)) / 2.0
+    # Include identity as first candidate
+    N_total = n_candidates + 1
+    angles_deg = np.empty(N_total)
+    dxs = np.empty(N_total)
+    dys = np.empty(N_total)
+    angles_deg[0], dxs[0], dys[0] = 0.0, 0.0, 0.0
+    angles_deg[1:] = rng.uniform(angle_range[0], angle_range[1], size=n_candidates)
+    dxs[1:] = rng.uniform(-trans_range, trans_range, size=n_candidates)
+    dys[1:] = rng.uniform(-trans_range, trans_range, size=n_candidates)
 
-    best_score = -np.inf
-    best_mask = square_mask.copy()
+    thetas = np.deg2rad(angles_deg)
+    cos_t = np.cos(thetas)
+    sin_t = np.sin(thetas)
 
-    num_steps = int(np.floor((angle_range[1] - angle_range[0]) / angle_step)) + 1
-    for angle_deg in np.linspace(angle_range[0], angle_range[1], num_steps):
-        theta = np.deg2rad(angle_deg)  # radians for the rotation term
-        rot_mat = cv2.getRotationMatrix2D(tuple(center), angle_deg, 1.0)
+    rel = corners - np.array([cx, cy])  # (4, 2)
 
-        for dx in range(-trans_range, trans_range + 1, trans_step):
-            for dy in range(-trans_range, trans_range + 1, trans_step):
-                # Compose rotation + translation
-                M = rot_mat.copy()
-                M[0, 2] += dx
-                M[1, 2] += dy
+    rot_x = cos_t[:, None] * rel[None, :, 0] + sin_t[:, None] * rel[None, :, 1]
+    rot_y = -sin_t[:, None] * rel[None, :, 0] + cos_t[:, None] * rel[None, :, 1]
 
-                transformed_mask = cv2.warpAffine(square_mask, M, (w, h), flags=cv2.INTER_NEAREST)
+    cand_x = rot_x + (cx + dxs)[:, None]  # (N_total, 4)
+    cand_y = rot_y + (cy + dys)[:, None]
 
-                contours_t, _ = cv2.findContours(transformed_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                if not contours_t:
-                    continue
-                cnt = max(contours_t, key=cv2.contourArea)
-                epsilon = 0.02 * cv2.arcLength(cnt, True)  # tolerance factor (2% of perimeter)
-                approx = cv2.approxPolyDP(cnt, epsilon, True)
+    # KDTree for fast nearest-vertex scoring
+    tree = cKDTree(curve_pts_px)
 
-                if len(approx) == 4:
-                    box = approx.reshape(-1, 2)
-                else:
-                    # fallback: still use rectangle if not 4-sided
-                    rect = cv2.minAreaRect(cnt)
-                    box = cv2.boxPoints(rect)
+    # Score all candidates: sum of nearest-vertex distances for 4 corners
+    all_pts = np.stack([cand_x.ravel(), cand_y.ravel()], axis=1)  # (N_total*4, 2)
+    dists, _ = tree.query(all_pts)
+    dists = dists.reshape(N_total, 4)  # (N_total, 4)
+    scores = -dists.mean(axis=1)  # negative mean distance
 
-                # Alignment score (your existing logic)
-                align_score, _, _, _ = compute_alignment_score_from_box(box, transformed_mask, dist_transform)
-                quality_score = squareness_metric(transformed_mask)
-                # --- Single-parameter transform penalty (option #2) ---
-                trans_norm_sq = float(dx*dx + dy*dy)          # ||t||^2 in pixels^2
-                rot_term_sq   = float((L * theta) * (L * theta))  # (L*theta)^2
-                penalty = lambda_reg * (trans_norm_sq + rot_term_sq)
-
-                total_score = align_score - penalty
-
-                if total_score > best_score:
-                    best_score = total_score
-                    best_mask = transformed_mask.copy()
-
-    return best_mask, best_score
+    best_idx = int(np.argmax(scores))
+    best_corners = np.stack([cand_x[best_idx], cand_y[best_idx]], axis=1)
+    return best_corners, float(scores[best_idx])
 
 
-def get_box(square_mask: np.ndarray) -> np.ndarray:
-    contours_t, _ = cv2.findContours(square_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours_t:
-        None
-    cnt = max(contours_t, key=cv2.contourArea)
-    epsilon = 0.02 * cv2.arcLength(cnt, True)  # tolerance factor (2% of perimeter)
-    approx = cv2.approxPolyDP(cnt, epsilon, True)
+# ---------------------------------------------------------------------------
+# Visualization
+# ---------------------------------------------------------------------------
 
-    if len(approx) == 4:
-        box = approx.reshape(-1, 2)
-    else:
-        # fallback: still use rectangle if not 4-sided
-        rect = cv2.minAreaRect(cnt)
-        box = cv2.boxPoints(rect)
-    return box
+def _draw_box_on_ax(ax, corners, color='lime', label=None):
+    from matplotlib.patches import Polygon as MplPoly
+    poly = MplPoly(corners, closed=True, fill=False,
+                   edgecolor=color, linewidth=1.5, linestyle='-')
+    ax.add_patch(poly)
+    ax.plot(corners[:, 0], corners[:, 1], 'o', color=color, markersize=4)
+    if label:
+        ax.text(corners[0, 0], corners[0, 1] - 4, label,
+                fontsize=6, color=color, ha='left', va='bottom')
+
+
+def make_visualization(vis_records, output_path):
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+
+    n_samples = len(vis_records)
+    modes = ['GT', 'GT (raster)', 'Pred raw', 'Snap pixel', 'Snap param.']
+    n_modes = len(modes)
+
+    fig, axes = plt.subplots(n_samples, n_modes,
+                             figsize=(3.2 * n_modes, 3.2 * n_samples),
+                             squeeze=False)
+
+    mode_keys = ['gt', 'gt_raster', 'pred_raw', 'snap_pixel', 'snap_param']
+    colors = ['cyan', 'yellow', 'lime', 'orange', 'magenta']
+
+    for row, rec in enumerate(vis_records):
+        curve = rec['curve_mask']
+        for col, (mkey, title, clr) in enumerate(zip(mode_keys, modes, colors)):
+            ax = axes[row, col]
+            ax.imshow(curve, cmap='gray', vmin=0, vmax=255)
+            entry = rec.get(mkey)
+            if entry is not None and entry['box'] is not None:
+                _draw_box_on_ax(ax, entry['box'], color=clr)
+                txt = (f"Sq(cont)={entry['sq_cont']:.3f}\n"
+                       f"Al(px)={entry['al_px']:.2f}\n"
+                       f"Al(param)={entry['al_param']:.4f}")
+                ax.text(2, 124, txt, fontsize=5, color='white',
+                        va='bottom', family='monospace',
+                        bbox=dict(facecolor='black', alpha=0.6, pad=1))
+            if row == 0:
+                ax.set_title(title, fontsize=9)
+            ax.axis('off')
+
+    fig.tight_layout(pad=0.5)
+    fig.savefig(output_path, dpi=180)
+    plt.close(fig)
+    print(f"Saved visualization -> {output_path}")
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
 
 def parse_args():
-    parser = argparse.ArgumentParser(description='Evaluate square generation model')
-    parser.add_argument('--checkpoint', type=str,
-                        default='model/checkpoints_curves/checkpoint_520.pth',
-                        help='Path to model checkpoint')
-    parser.add_argument('--output-dir', type=str, default='evaluation_results',
-                        help='Directory to save evaluation results')
-    parser.add_argument('--seed', type=int, default=42, help='Random seed')
-    parser.add_argument('--batch-size', type=int, default=64, help='Batch size for evaluation')
-    parser.add_argument('--num-workers', type=int, default=2, help='Number of workers for data loading')
-    parser.add_argument('--no-snap', action='store_true', help='Disable snapping squares to curves')
-    return parser.parse_args()
+    p = argparse.ArgumentParser(
+        description='Continuous-space (parametric) evaluation for inscribed squares')
+    p.add_argument('--checkpoint', type=str,
+                   default='model/checkpoints_curves/checkpoint_520.pth',
+                   help='Path to model checkpoint')
+    p.add_argument('--output-dir', type=str, default='evaluation_results')
+    p.add_argument('--seed', type=int, default=42)
+    p.add_argument('--batch-size', type=int, default=128)
+    p.add_argument('--num-workers', type=int, default=2)
+    p.add_argument('--sampling-steps', type=int, default=25)
+    p.add_argument('--sampling-schedule', type=str,
+                   default='first_mid_last:20,3,2')
+    p.add_argument('--gt-only', action='store_true',
+                   help='Skip model inference; evaluate GT only (sanity check)')
+    p.add_argument('--n-snap-candidates', type=int, default=40000)
+    p.add_argument('--n-vis', type=int, default=8)
+    p.add_argument('--dataset-path', type=str, default=None,
+                   help='Override dataset path from checkpoint config')
+    p.add_argument('--n-eval', type=int, default=None,
+                   help='Max number of val samples to evaluate (default: all)')
+    return p.parse_args()
 
-if __name__ == '__main__':
+
+def main():
     args = parse_args()
-
-    w_snap = not args.no_snap
+    if args.sampling_steps is not None and args.sampling_steps <= 0:
+        args.sampling_steps = None
+    gt_only = args.gt_only
     seed = args.seed
-    image_size = 128
     output_dir = args.output_dir
-
-    batch_size = args.batch_size
-    num_workers = args.num_workers
-
-    # Create output directory if it doesn't exist
-    import os
     os.makedirs(output_dir, exist_ok=True)
 
-    # n_squares_per_curve = 3
     np.random.seed(seed)
     torch.manual_seed(seed)
+    rng = np.random.default_rng(seed)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device(
+        "cuda" if torch.cuda.is_available()
+        else "mps" if torch.backends.mps.is_available()
+        else "cpu"
+    )
+
+    # ------------------------------------------------------------------
+    # Load checkpoint & config
+    # ------------------------------------------------------------------
+    from omegaconf import OmegaConf
     checkpoint_path = args.checkpoint
     checkpoint = torch.load(checkpoint_path, weights_only=False, map_location=device)
     config = checkpoint['config']
+    # Allow adding new keys to the config struct
+    OmegaConf.set_struct(config, False)
 
-    # Model
-    model = UNet(
-        device=device,
-        **config['model']
-        )
+    dataset_path = _Path(str(config['dataset']['dataset_path']))
+    if args.dataset_path:
+        dataset_path = _Path(args.dataset_path)
+        config['dataset']['dataset_path'] = args.dataset_path
+    actual_count = len(list(dataset_path.glob("curve_*.png")))
+    if actual_count > 0 and actual_count != config['dataset']['num_samples']:
+        print(f"Overriding num_samples: {config['dataset']['num_samples']} -> {actual_count}")
+        config['dataset']['num_samples'] = actual_count
 
-    state_dict = checkpoint["state_dict"]
-    state_dict = remove_weight_prefixes(state_dict)
-    model.load_state_dict(state_dict)
-    model.eval()
+    image_size = config['dataset']['image_size']
 
-    # Scheduler
-    scheduler = DDIM(device=device,
-                        **config['scheduler'],)
+    # ------------------------------------------------------------------
+    # Check for parametric data
+    # ------------------------------------------------------------------
+    has_parametric = (dataset_path / "curve_pts_0.npy").exists()
+    if has_parametric:
+        print("Parametric data (.npy) found — using true continuous metrics.")
+        config['dataset']['return_parametric'] = True
+    else:
+        print("WARNING: No parametric .npy files found. "
+              "Falling back to raster-based evaluation.\n"
+              "Regenerate dataset with latest code to get true parametric metrics.")
 
+    # ------------------------------------------------------------------
+    # Model + scheduler
+    # ------------------------------------------------------------------
+    if not gt_only:
+        model = UNet(device=device, **config['model'])
+        state_dict = remove_weight_prefixes(checkpoint['state_dict'])
+        model.load_state_dict(state_dict)
+        model.eval()
 
+        scheduler_type = config.get('scheduler_type', 'ddim')
+        if scheduler_type == 'flow_matching':
+            from schedulers.flow_matching import FlowMatching
+            scheduler = FlowMatching(device=device, **config['scheduler'])
+        else:
+            from schedulers.ddim import DDIM
+            scheduler = DDIM(device=device, **config['scheduler'])
+
+    # ------------------------------------------------------------------
+    # Dataset / dataloader (validation split)
+    # ------------------------------------------------------------------
     dataset = get_dataset(config)
-
     val_fraction = config['dataset']['val_fraction']
-
     val_size = int(len(dataset) * val_fraction)
     train_size = len(dataset) - val_size
-
-    _, val_dataset = random_split(dataset, [train_size, val_size], generator=torch.Generator().manual_seed(seed))
-
+    _, val_dataset = random_split(
+        dataset, [train_size, val_size],
+        generator=torch.Generator().manual_seed(seed))
 
     val_dataloader = DataLoader(
-        val_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-    )
+        val_dataset, batch_size=args.batch_size,
+        shuffle=False, num_workers=args.num_workers)
 
-
+    # ------------------------------------------------------------------
+    # Evaluation loop
+    # ------------------------------------------------------------------
     import pandas as pd
 
     results = []
+    vis_records = []
+    sample_idx = 0
+    n_eval = args.n_eval  # None means all
 
-    for curve_imgs, square_gt_imgs in tqdm(val_dataloader):
+    for batch in tqdm(val_dataloader, desc="Evaluating"):
 
-        pred_square_img = scheduler.sample(
-            model,
-            n_samples=len(square_gt_imgs),
-            condition=curve_imgs,
-            guidance_scale=1,
-            seed=seed,
-            return_dict=True,
-        )['x_0']  # B X 1 X H X W
+        if n_eval is not None and sample_idx >= n_eval:
+            break
 
-        for idx, (sq_gt, sq, crv) in enumerate(zip(list(square_gt_imgs), list(pred_square_img), list(curve_imgs))):
+        if has_parametric:
+            curve_imgs, square_gt_imgs, curve_pts_batch, sq_corners_batch = batch
+        else:
+            curve_imgs, square_gt_imgs = batch
+            curve_pts_batch = None
+            sq_corners_batch = None
 
-            if w_snap:
-                square_mask, _ = snap_square_by_rigid_transform(sq, crv)
+        if gt_only:
+            pred_square_img = square_gt_imgs
+        else:
+            pred_square_img = scheduler.sample(
+                model,
+                n_samples=len(square_gt_imgs),
+                condition=curve_imgs,
+                guidance_scale=1,
+                seed=seed,
+                return_dict=True,
+                sampling_steps=args.sampling_steps,
+                sampling_schedule=args.sampling_schedule,
+            )['x_0']
+
+        B = len(curve_imgs)
+        for i in range(B):
+            crv = curve_imgs[i]
+            sq_gt = square_gt_imgs[i]
+            sq_pred = pred_square_img[i]
+
+            curve_mask = _to_numpy255(crv)
+            gt_mask = _to_numpy255(sq_gt)
+            pred_mask = _to_numpy255(sq_pred)
+            dist_transform = distance_transform_edt(curve_mask == 0)
+
+            # --- Parametric GT data (if available) ---
+            if has_parametric:
+                # Convert from normalised [-1,1] to pixel coords
+                gt_corners_param = parametric_to_pixel(
+                    sq_corners_batch[i].numpy(), image_size)
+                curve_pts_px = parametric_to_pixel(
+                    curve_pts_batch[i].numpy(), image_size)
             else:
-                square_mask = _to_numpy255(sq)
-            square_gt_mask = _to_numpy255(sq_gt)
-            curve_mask  = _to_numpy255(crv)
-            dist_transform = cv2.distanceTransform(255 - curve_mask, cv2.DIST_L2, 5)
+                gt_corners_param = None
+                curve_pts_px = None
 
-            box    = get_box(square_mask)
-            box_gt = get_box(square_gt_mask)
-            if box is None or box_gt is None:
+            # --- Extract corners from raster ---
+            box_gt_raster = get_box(gt_mask)
+            box_pred_raw = get_box(pred_mask)
+
+            if box_pred_raw is None:
+                sample_idx += 1
                 continue
 
-            # Distances
-            _, _, _, avg_dist    = compute_alignment_score_from_box(box, square_mask, dist_transform)
-            _, _, _, avg_dist_gt = compute_alignment_score_from_box(box_gt, square_gt_mask, dist_transform)
+            # Use parametric GT corners when available, else raster
+            box_gt = gt_corners_param if gt_corners_param is not None else box_gt_raster
+            if box_gt is None:
+                sample_idx += 1
+                continue
 
-            # Prediction metrics
-            quality_score_rect    = squareness_metric(square_mask)
-            quality_score_moments = squareness_metric_moments(square_mask)
-            quality_score_polygon = squareness_metric_4_polygon_fit(square_mask)
+            # --- Pixel snap (existing raster method) ---
+            snapped_mask, _ = snap_square_by_rigid_transform(sq_pred, crv)
+            box_snap_pixel = get_box(snapped_mask)
 
-            # GT metrics
-            quality_score_gt_rect    = squareness_metric(square_gt_mask)
-            quality_score_gt_moments = squareness_metric_moments(square_gt_mask)
-            quality_score_gt_polygon = squareness_metric_4_polygon_fit(square_gt_mask)
+            # --- Parametric snap ---
+            if curve_pts_px is not None:
+                box_snap_param, _ = snap_parametric(
+                    box_pred_raw, curve_pts_px,
+                    n_candidates=args.n_snap_candidates, rng=rng)
+            else:
+                # Fallback: use DT-based snap
+                box_snap_param = box_pred_raw  # no snap
 
-            # Collect all results per sample
-            results.append({
-                "sample_id": idx,
-                "avg_dist_pred": avg_dist,
-                "avg_dist_gt": avg_dist_gt,
-                "squareness_rect_pred": quality_score_rect,
-                "squareness_moments_pred": quality_score_moments,
-                "squareness_polygon_pred": quality_score_polygon,
-                "squareness_rect_gt": quality_score_gt_rect,
-                "squareness_moments_gt": quality_score_gt_moments,
-                "squareness_polygon_gt": quality_score_gt_polygon,
-            })
+            # --- Compute metrics for each mode ---
+            row = dict(sample_id=sample_idx)
 
-    # Save all per-sample results into CSV
+            for label, box in [('gt', box_gt),
+                                ('gt_raster', box_gt_raster),
+                                ('pred_raw', box_pred_raw),
+                                ('snap_pixel', box_snap_pixel),
+                                ('snap_param', box_snap_param)]:
+                if box is None:
+                    for suffix in ('_sq_px', '_al_px', '_sq_cont', '_al_param'):
+                        row[f'{label}{suffix}'] = np.nan
+                    continue
+
+                # Pixel-space squareness from raster
+                if label in ('snap_param', 'pred_raw'):
+                    sq_px = squareness_metric(pred_mask)  # rigid preserves shape
+                elif label == 'snap_pixel':
+                    sq_px = squareness_metric(snapped_mask)
+                elif label in ('gt', 'gt_raster'):
+                    sq_px = squareness_metric(gt_mask)
+
+                # Pixel-space alignment (integer DT lookup)
+                al_px = alignment_pixel(box, dist_transform)
+
+                # Parametric alignment (point-to-polyline on continuous curve)
+                if curve_pts_px is not None:
+                    al_param = alignment_parametric(box, curve_pts_px)
+                else:
+                    al_param = alignment_bilinear_dt(box, dist_transform)
+
+                # Continuous squareness (same formula as paper, on float corners)
+                sq_cont = squareness_continuous(box)
+
+                row[f'{label}_sq_px'] = sq_px
+                row[f'{label}_al_px'] = al_px
+                row[f'{label}_sq_cont'] = sq_cont
+                row[f'{label}_al_param'] = al_param
+
+            results.append(row)
+
+            # Visualisation data
+            if len(vis_records) < args.n_vis:
+                vis_entry = dict(curve_mask=curve_mask)
+                for label, box in [('gt', box_gt),
+                                    ('gt_raster', box_gt_raster),
+                                    ('pred_raw', box_pred_raw),
+                                    ('snap_pixel', box_snap_pixel),
+                                    ('snap_param', box_snap_param)]:
+                    if box is None:
+                        vis_entry[label] = None
+                    else:
+                        vis_entry[label] = dict(
+                            box=box,
+                            sq_cont=row[f'{label}_sq_cont'],
+                            al_px=row[f'{label}_al_px'],
+                            al_param=row[f'{label}_al_param'],
+                        )
+                vis_records.append(vis_entry)
+
+            sample_idx += 1
+            if n_eval is not None and sample_idx >= n_eval:
+                break
+    # ------------------------------------------------------------------
     df = pd.DataFrame(results)
-    out_filename = "eval_squares_snapped_results.csv" if w_snap else "eval_squares_results.csv"
-    out_path = os.path.join(output_dir, out_filename)
-    df.to_csv(out_path, index=False)
+    tag = "gt_only" if gt_only else "full"
+    csv_path = os.path.join(output_dir, f"eval_continuous_{tag}.csv")
+    df.to_csv(csv_path, index=False)
+    print(f"\nSaved {len(df)} samples -> {csv_path}")
 
-    print(f"Saved {len(df)} samples to {out_path}")
-    print(df.describe())
+    # ------------------------------------------------------------------
+    # Summary table
+    # ------------------------------------------------------------------
+    print("\n" + "=" * 78)
+    print("SUMMARY  (mean over all valid samples)")
+    print("=" * 78)
+
+    modes = [('gt', 'GT'),
+             ('gt_raster', 'GT (raster)'),
+             ('pred_raw', 'Pred raw'),
+             ('snap_pixel', 'Snap pixel'),
+             ('snap_param', 'Snap param.')]
+
+    header = (f"{'Mode':<16} {'Sq(px)':>8} {'Sq(cont)':>9} "
+              f"{'Al(px)':>8} {'Al(param)':>10}")
+    print(header)
+    print("-" * len(header))
+    for key, label in modes:
+        sq_px = df[f'{key}_sq_px'].mean()
+        sq_ct = df[f'{key}_sq_cont'].mean()
+        al_px = df[f'{key}_al_px'].mean()
+        al_pr = df[f'{key}_al_param'].mean()
+        print(f"{label:<16} {sq_px:>8.3f} {sq_ct:>9.3f} "
+              f"{al_px:>8.2f} {al_pr:>10.4f}")
+
+    # Combined rebuttal table
+    print("\n" + "=" * 78)
+    print("REBUTTAL TABLE")
+    print("=" * 78)
+    header2 = f"{'':>16} {'Squareness':>12} {'Alignment':>12}"
+    print(header2)
+    print("-" * len(header2))
+
+    # Pixel-space block
+    print("Pixel-space")
+    for key, label, sq_col, al_col in [
+        ('gt',        '  GT',        'sq_px', 'al_px'),
+        ('pred_raw',  '  Pred',      'sq_px', 'al_px'),
+        ('snap_pixel','  + snap',    'sq_px', 'al_px'),
+    ]:
+        sq = df[f'{key}_{sq_col}'].mean()
+        al = df[f'{key}_{al_col}'].mean()
+        print(f"{label:<16} {sq:>12.3f} {al:>12.2f}")
+
+    print("-" * len(header2))
+
+    # Parametric-space block
+    print("Parametric-space")
+    for key, label, sq_col, al_col in [
+        ('gt',         '  GT',          'sq_cont', 'al_param'),
+        ('gt_raster',  '  GT (raster)', 'sq_cont', 'al_param'),
+        ('pred_raw',   '  Pred',        'sq_cont', 'al_param'),
+        ('snap_param', '  + snap',      'sq_cont', 'al_param'),
+    ]:
+        sq = df[f'{key}_{sq_col}'].mean()
+        al = df[f'{key}_{al_col}'].mean()
+        print(f"{label:<16} {sq:>12.3f} {al:>12.4f}")
+
+    # LaTeX version
+    print("\n% LaTeX version:")
+    print(r"\begin{tabular}{lcc}")
+    print(r"\toprule")
+    print(r"& Squareness $\uparrow$ & Alignment $\downarrow$ \\")
+    print(r"\midrule")
+    print(r"\multicolumn{3}{l}{\textit{Pixel-space evaluation}} \\")
+    for key, label, sq_col, al_col in [
+        ('gt',        'GT',     'sq_px', 'al_px'),
+        ('pred_raw',  'Pred',   'sq_px', 'al_px'),
+        ('snap_pixel','+ snap', 'sq_px', 'al_px'),
+    ]:
+        sq = df[f'{key}_{sq_col}'].mean()
+        al = df[f'{key}_{al_col}'].mean()
+        print(f"{label} & {sq:.3f} & {al:.2f} \\\\")
+    print(r"\midrule")
+    print(r"\multicolumn{3}{l}{\textit{Parametric-space evaluation}} \\")
+    for key, label, sq_col, al_col in [
+        ('gt',         'GT',          'sq_cont', 'al_param'),
+        ('gt_raster',  'GT (raster)', 'sq_cont', 'al_param'),
+        ('pred_raw',   'Pred',        'sq_cont', 'al_param'),
+        ('snap_param', '+ snap',      'sq_cont', 'al_param'),
+    ]:
+        sq = df[f'{key}_{sq_col}'].mean()
+        al = df[f'{key}_{al_col}'].mean()
+        print(f"{label} & {sq:.3f} & {al:.2f} \\\\")
+    print(r"\bottomrule")
+    print(r"\end{tabular}")
+
+    # ------------------------------------------------------------------
+    # Visualization
+    # ------------------------------------------------------------------
+    if vis_records:
+        viz_path = os.path.join(output_dir, f"eval_continuous_viz_{tag}.png")
+        make_visualization(vis_records, viz_path)
+
+
+if __name__ == '__main__':
+    main()

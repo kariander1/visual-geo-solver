@@ -18,6 +18,13 @@ dtype_map = {
     "bfloat16": torch.bfloat16,
 }
 
+def _resolve_autocast_dtype(autocast_dtype, device):
+    """Downgrade bfloat16 to float16 on MPS (not supported)."""
+    dtype = dtype_map[autocast_dtype]
+    if 'mps' in str(device) and dtype == torch.bfloat16:
+        return torch.float16
+    return dtype
+
 def validate_regression_model(
     config,
     model,
@@ -49,7 +56,7 @@ def validate_regression_model(
             # Use t=0 for regression (no noise)
             t = torch.zeros(condition_imgs.size(0), 1, device=device)
 
-            with torch.autocast(device_type=device, dtype=dtype_map[autocast_dtype]):
+            with torch.autocast(device_type=device, dtype=_resolve_autocast_dtype(autocast_dtype, device)):
                 pred_imgs = model(torch.zeros_like(target_imgs), t, condition_imgs)
                 loss = calc_regression_loss(
                     pred_imgs,
@@ -130,11 +137,16 @@ def sample_regression(
     seed: int,
     log_to_wandb: bool,
     wandb_title: str = 'Validation Samples',
+    save_dir: str = None,
     **kwargs
 ):
     model.eval()
     results = []
-    
+
+    # Create save directory if saving locally
+    if save_dir is not None:
+        os.makedirs(save_dir, exist_ok=True)
+
     logged_images = []
     for sample_idx in range(n_samples):
         # Assume each sample is (condition_img, gt_target_img)
@@ -144,7 +156,7 @@ def sample_regression(
         condition = condition_img.unsqueeze(0).to(model.device)      # [1, C, H, W]
         gt_target_img = gt_target_img.unsqueeze(0).to(model.device)  # [1, C, H, W]
         gt_target_img = dataset.to_image(gt_target_img)  # Convert to image format
-        
+
         with torch.no_grad():
             # Use t=0 for regression
             t = torch.zeros(1, 1, device=model.device)
@@ -153,13 +165,15 @@ def sample_regression(
 
         results.append(pred_img)
 
+        save_path = os.path.join(save_dir, f"sample_{sample_idx}.png") if save_dir else None
         fig_or_path = plot_condition_vs_images_grid(
             condition_img,
             gt=gt_target_img,
             predictions=[pred_img],
             x_axis=["Prediction"],
             draw_condition_on_pred=True,
-            title=f"Sample={sample_idx}"
+            title=f"Sample={sample_idx}",
+            save_path=save_path,
         )
         if log_to_wandb:
             logged_images.append(wandb.Image(fig_or_path, caption=f"Sample={sample_idx}"))
@@ -257,7 +271,7 @@ def train_regression_model(
                 # Use t=0 for regression (no diffusion process)
                 t = torch.zeros(condition_imgs.size(0), 1, device=device)
 
-                with torch.autocast(device_type=device, dtype=dtype_map[autocast_dtype]):
+                with torch.autocast(device_type=device, dtype=_resolve_autocast_dtype(autocast_dtype, device)):
                     # Feed zero noise (regression mode) 
                     pred_imgs = model(torch.zeros_like(target_imgs), t, condition_imgs)
                     
@@ -296,14 +310,17 @@ def train_regression_model(
 
             if (train_step + 1) % train_viz_config['plot_every_n_steps'] == 0:
                 image_pixel_space = dataset.to_image(target_imgs)
+                train_viz_dir = os.path.join(outputs_dir, "train_viz")
+                os.makedirs(train_viz_dir, exist_ok=True)
                 train_fig = plot_training_visualization_grid(
                     condition_imgs,
                     target_imgs,
                     target_imgs,  # posterior same as target for regression
                     image_pixel_space,
                     pred_imgs.detach(),  # Use predictions as "eps" for visualization
-                    pred_imgs.detach(),  # Use predictions as "x_t" for visualization  
+                    pred_imgs.detach(),  # Use predictions as "x_t" for visualization
                     t,
+                    save_path=os.path.join(train_viz_dir, f"step_{train_step}.png"),
                     **train_viz_config,
                 )
                 if master_process:
@@ -311,7 +328,10 @@ def train_regression_model(
                         "Training Viz": wandb.Image(train_fig, caption=f"Train step {train_step}"),
                         }, step=train_step)
             train_step += 1
-            torch.cuda.synchronize()  # Ensure all operations are complete before measuring time
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            elif hasattr(torch.mps, 'synchronize'):
+                torch.mps.synchronize()
             t1 = time.time()
             dt = (t1 - t0)
             imgs_per_sec = grad_accum_steps * condition_imgs.size(0) * ddp_world_size / dt
@@ -344,19 +364,22 @@ def train_regression_model(
             
         if master_process and (epoch + 1) % sampling_config['sample_every_n_epochs'] == 0:
             logger.info(f"Sampling images for epoch {epoch + 1}")
+            samples_dir = os.path.join(outputs_dir, "samples", f"epoch_{epoch + 1}")
             sample_regression(
                 model,
                 val_dataloader,
                 dataset,
                 wandb_title="Validation Samples",
+                save_dir=os.path.join(samples_dir, "val"),
                 **sampling_config
             )
-            
+
             sample_regression(
                 model,
                 train_dataloader,
                 dataset,
                 wandb_title="Training Samples",
+                save_dir=os.path.join(samples_dir, "train"),
                 **sampling_config
             )
             

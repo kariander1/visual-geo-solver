@@ -36,8 +36,10 @@ class CurveImageDataset(Dataset):
         curve_kwargs={},
         max_squares=5,
         fill_square=False,
+        return_parametric=False,
         **kwargs
     ):
+        self.return_parametric = return_parametric
         self.num_samples = num_samples
         self.image_size = image_size
         self.dataset_path = Path(dataset_path)
@@ -60,13 +62,17 @@ class CurveImageDataset(Dataset):
             "max_squares": max_squares,
             }
         if self.save_on_generate:
-            self.generator = self._generate_curve_and_square(
-                **self.gen_params
-            )
             self.dataset_path.mkdir(parents=True, exist_ok=True)
-            for i in tqdm(range(num_samples), desc="Pre-generating samples"):
-                sample = self._generate_sample()
-                self._save_sample_as_png(sample, i)
+            num_workers = kwargs.get('num_workers', 1)
+            if num_workers > 1:
+                self._generate_parallel(num_samples, num_workers)
+            else:
+                self.generator = self._generate_curve_and_square(
+                    **self.gen_params
+                )
+                for i in tqdm(range(num_samples), desc="Pre-generating samples"):
+                    curve_img, square_img, curve_pts, square_corners = self._generate_sample()
+                    self._save_sample(curve_img, square_img, curve_pts, square_corners, i)
 
         self._build_transform(image_size)
         
@@ -152,7 +158,21 @@ class CurveImageDataset(Dataset):
         curve_path = self.dataset_path / f"curve_{idx}.png"
         square_path = self.dataset_path / f"square_{idx}.png"
 
-        return self.load_image_pair(curve_path, square_path)
+        result = self.load_image_pair(curve_path, square_path)
+
+        if self.return_parametric:
+            curve_pts_path = self.dataset_path / f"curve_pts_{idx}.npy"
+            square_corners_path = self.dataset_path / f"square_corners_{idx}.npy"
+            if not curve_pts_path.exists() or not square_corners_path.exists():
+                raise FileNotFoundError(
+                    f"Parametric data not found for sample {idx}. "
+                    "Regenerate the dataset with the latest code to save .npy files."
+                )
+            curve_pts = torch.from_numpy(np.load(curve_pts_path)).float()
+            square_corners = torch.from_numpy(np.load(square_corners_path)).float()
+            return result + (curve_pts, square_corners)
+
+        return result
 
     def load_image_pair(self, curve_path, square_path):
         """
@@ -170,8 +190,11 @@ class CurveImageDataset(Dataset):
                 return
 
     def generate_sample(self, seed=None):
-        curve_tensor_img, square_tensor_img = self._generate_sample(seed=seed)
-        return self._load_and_process(curve_tensor_img, square_tensor_img)
+        curve_tensor_img, square_tensor_img, curve_pts, square_corners = self._generate_sample(seed=seed)
+        result = self._load_and_process(curve_tensor_img, square_tensor_img)
+        if self.return_parametric:
+            return result + (curve_pts, square_corners)
+        return result
 
     def _generate_sample(self, seed=None):
         try:
@@ -179,7 +202,7 @@ class CurveImageDataset(Dataset):
         except StopIteration:
             self.generator = self._generate_curve_and_square(**self.gen_params, seed=seed)
             curve_tensor, square_tensor = next(self.generator)
-            
+
 
 
         curve_img = draw_periodic_spline_image(curve_tensor, self.image_size, **self.curve_kwargs)
@@ -189,7 +212,7 @@ class CurveImageDataset(Dataset):
         curve_tensor_img = (torch.tensor(curve_img).unsqueeze(0) / 255.0) * 2 - 1
         square_tensor_img = (torch.tensor(square_img).unsqueeze(0) / 255.0) * 2 - 1
 
-        return curve_tensor_img, square_tensor_img
+        return curve_tensor_img, square_tensor_img, curve_tensor, square_tensor
 
     def _apply_distance_transform(self, square_tensor_img):
         binary_mask = (square_tensor_img.numpy() != -1)
@@ -220,10 +243,48 @@ class CurveImageDataset(Dataset):
 
         return signed_tensor
     
+    def _generate_parallel(self, num_samples, num_workers):
+        """Generate samples in parallel using multiprocessing."""
+        import multiprocessing as mp
+        from functools import partial
+
+        # Use 'fork' context to avoid spawn guard issues
+        ctx = mp.get_context('fork')
+
+        # Use finer chunks for better progress reporting
+        samples_per_chunk = max(100, num_samples // (num_workers * 20))
+        chunks = []
+        for start in range(0, num_samples, samples_per_chunk):
+            end = min(start + samples_per_chunk, num_samples)
+            chunks.append((start, end))
+
+        worker_fn = partial(
+            _generate_worker,
+            dataset_path=str(self.dataset_path),
+            image_size=self.image_size,
+            gen_params=self.gen_params,
+            curve_kwargs=self.curve_kwargs,
+            square_kwargs=self.square_kwargs,
+        )
+
+        with ctx.Pool(num_workers) as pool:
+            list(tqdm(
+                pool.imap_unordered(worker_fn, chunks),
+                total=len(chunks),
+                desc=f"Generating ({num_workers} workers)",
+            ))
+
     def _save_sample_as_png(self, sample, idx):
-        curve_img, square_img = sample
+        curve_img, square_img = sample[0], sample[1]
         TF.to_pil_image((curve_img + 1) / 2).save(self.dataset_path / f"curve_{idx}.png")
         TF.to_pil_image((square_img + 1) / 2).save(self.dataset_path / f"square_{idx}.png")
+
+    def _save_sample(self, curve_img, square_img, curve_pts, square_corners, idx):
+        """Save images as PNG and parametric data as .npy."""
+        TF.to_pil_image((curve_img + 1) / 2).save(self.dataset_path / f"curve_{idx}.png")
+        TF.to_pil_image((square_img + 1) / 2).save(self.dataset_path / f"square_{idx}.png")
+        np.save(self.dataset_path / f"curve_pts_{idx}.npy", curve_pts.numpy())
+        np.save(self.dataset_path / f"square_corners_{idx}.npy", square_corners.numpy())
         
     
     def save_sample_as_png(self, sample, save_path: str):
@@ -349,6 +410,15 @@ class CurveImageDataset(Dataset):
             if is_circle or not is_self_intersecting(x, y):
                 break
 
+        # Snap nearest curve points to exact square corners so that
+        # the polyline passes through every corner exactly (alignment = 0).
+        for j in range(square_points.shape[0]):
+            sx, sy = square_points[j]
+            dists_sq = (x - sx)**2 + (y - sy)**2
+            closest_idx = int(np.argmin(dists_sq))
+            x[closest_idx] = sx
+            y[closest_idx] = sy
+
         # Convert curve to tensor
         curve_tensor = torch.tensor(np.stack([x, y], axis=1))
 
@@ -366,6 +436,49 @@ class CurveImageDataset(Dataset):
             # Yield each square individually with the full curve
             yield _fit_to_unit_box_with_padding(curve_tensor.clone(), square_tensor.clone())
 
+
+
+def _generate_worker(chunk, dataset_path, image_size, gen_params, curve_kwargs, square_kwargs):
+    """Standalone worker for parallel generation. Must be top-level for pickling."""
+    from utils.viz import draw_square as _draw_sq
+    dataset_path = Path(dataset_path)
+    start, end = chunk
+    rng = np.random.default_rng(start)  # deterministic per-chunk seed
+
+    # Create a temporary generator instance
+    gen_params_copy = dict(gen_params)
+    gen_params_copy['seed'] = int(rng.integers(0, 2**31))
+
+    # We need a fresh generator for this chunk
+    dummy = CurveImageDataset.__new__(CurveImageDataset)
+    dummy.image_size = image_size
+    dummy.gen_params = gen_params_copy
+    dummy._rng = rng
+    dummy.generator = dummy._generate_curve_and_square(**gen_params_copy)
+    dummy.curve_kwargs = curve_kwargs
+    dummy.square_kwargs = square_kwargs
+
+    for idx in range(start, end):
+        try:
+            curve_tensor, square_tensor = next(dummy.generator)
+        except StopIteration:
+            gen_params_copy['seed'] = int(rng.integers(0, 2**31))
+            dummy.generator = dummy._generate_curve_and_square(**gen_params_copy)
+            curve_tensor, square_tensor = next(dummy.generator)
+
+        curve_img = draw_periodic_spline_image(curve_tensor, image_size, **curve_kwargs)
+        square_img = np.full((image_size, image_size), 255, dtype=np.uint8)
+        _draw_sq(square_img, square_tensor, image_size, **square_kwargs)
+
+        curve_t = (torch.tensor(curve_img).unsqueeze(0) / 255.0) * 2 - 1
+        square_t = (torch.tensor(square_img).unsqueeze(0) / 255.0) * 2 - 1
+
+        TF.to_pil_image((curve_t + 1) / 2).save(dataset_path / f"curve_{idx}.png")
+        TF.to_pil_image((square_t + 1) / 2).save(dataset_path / f"square_{idx}.png")
+        np.save(dataset_path / f"curve_pts_{idx}.npy", curve_tensor.numpy())
+        np.save(dataset_path / f"square_corners_{idx}.npy", square_tensor.numpy())
+
+    return end - start
 
 
 def _fit_to_unit_box_with_padding(curve_tensor, square_tensor, padding_ratio=0.05):
@@ -414,9 +527,7 @@ def draw_periodic_spline_image(curve_tensor, image_size, color=0, thickness_rang
     img = np.full((image_size, image_size), 255, dtype=np.uint8)
     pts = (curve_tensor * (image_size // 2) + image_size // 2).numpy().astype(np.int32)
     thickness = np.random.choice(thickness_range)
-    for i in range(len(pts) - 1):
-        cv2.line(img, tuple(pts[i]), tuple(pts[i + 1]), color=color, thickness=thickness)
-    cv2.line(img, tuple(pts[-1]), tuple(pts[0]), color=color, thickness=thickness)
+    cv2.polylines(img, [pts], isClosed=True, color=color, thickness=thickness)
     return img
 
 

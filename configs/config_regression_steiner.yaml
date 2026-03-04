@@ -5,36 +5,22 @@ hydra:
 defaults:
   - _self_
 
+training_mode: "regression"  # Options: "diffusion", "regression"
 
 float32_matmul_precision: 'high'
 compile_model: true
 save_git_diff: true
 
-# Dataset configuration
 dataset:
-  type: "curves"
-  use_distance_transform: false
-  use_signed_distance_transform: false
-  fill_square: true
-  num_samples: 100000
+  type: "graphs_steiner"
+  num_samples: null
   save_on_generate: false
-  num_workers: 8
-  dataset_path: "data/curves_data"
+  use_distance_transform: false
+  steiner_data_path: "data/steiner_data_10_20"
   image_size: 128
   val_fraction: 0.1
-  side_length_range: [0.3, 0.7]
-  H_range: [6, 30]
-  shift_range: 0.5
-  max_squares: 5  # maximum number of squares to generate
-  num_points: 500
-  circles_ratio: 0.1
-  curve_kwargs:
-    thickness_range: [1]
-  ellipse_kwargs:
-    thickness: 1
-  square_kwargs:
-    thickness: 1
-    fill_shape: false
+  use_exact_steiner: true
+  seed: ${train.seed}
 
 model:
   time_emb_dim: 128
@@ -51,7 +37,6 @@ metrics:
     decay_scale: 7.5
 
 # Training configuration
-scheduler_type: "ddim" # "flow_matching"
 train:
   autocast_dtype: 'bfloat16'
   clip_grad_norm: true
@@ -64,30 +49,31 @@ train:
       lr: 6e-4
       fused: true
 
+    # Regression-specific loss configuration
   loss_config:
-    loss_func: "l2"
-    loss_target: "eps"
+    loss_func: "l2"  # Options: l2, l1, mse, bce
     piecewise_loss: false
-    weight_x_0_by_timestep: false 
+
   lr_scheduler_config:
     num_cycles: 0.5
     num_warmup_steps: 100
     min_lr_factor: 0.1
-  
-  grad_accum_steps: 4
-  batch_size: 256
-  num_epochs: 1000
+
+
+  grad_accum_steps: 8
+  batch_size: 128
+  num_epochs: 100
   seed: 42
   p_null: 0
-  clean_prev_checkpoints: true
-  checkpoint_every_n_epochs: 5
+  clean_prev_checkpoints: false
+  checkpoint_every_n_epochs: 2
   validation_config:
-    validate_every_n_epochs: 2
+    validate_every_n_epochs: 1
     n_samples_for_metrics: 1000
     guidance_scale: 1.0
     seed: ${train.seed}
   sampling_config:
-    sample_every_n_epochs: 2
+    sample_every_n_epochs: 1
     n_samples: 4
     n_seeds_per_sample: 4
     guidance_scale: [1]
@@ -96,20 +82,22 @@ train:
     log_to_wandb: true
 
   log_every_n_steps: 10
-  train_viz_config:   
+
+  train_viz_config:
+
     plot_every_n_steps: 1000
     num_samples_to_plot: 4
-    
+
   null_condition: 0
 
 # Diffusion scheduler configuration
 scheduler:
   diffusion_steps: 100
   eta: 0.0
-  
+
 # Wandb config (optional empty dict or override as needed)
 wandb:
-  project: "geometric-solver-curves"
+  project: "geometric-solver-steiner-regression"
   entity: "entity"  # fill if needed
   mode: "offline"  # options: online, offline, disabled
   api_key: "key" # fill if needed

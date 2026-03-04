@@ -20,6 +20,13 @@ dtype_map = {
     "bfloat16": torch.bfloat16,
 }
 
+def _resolve_autocast_dtype(autocast_dtype, device):
+    """Downgrade bfloat16 to float16 on MPS (not supported)."""
+    dtype = dtype_map[autocast_dtype]
+    if 'mps' in str(device) and dtype == torch.bfloat16:
+        return torch.float16
+    return dtype
+
 def validate_img_diffusion_model(
     config,
     model,
@@ -55,7 +62,7 @@ def validate_img_diffusion_model(
             t = torch.randint(1, scheduler.diffusion_steps, size=[ellipse_imgs.size(0), 1], device=device)
             x_t, eps = scheduler.noise(posterior, t)
 
-            with torch.autocast(device_type=device, dtype=dtype_map[autocast_dtype]):
+            with torch.autocast(device_type=device, dtype=_resolve_autocast_dtype(autocast_dtype, device)):
                 noise_pred = model(x_t, t, ellipse_imgs)
                 loss = calc_loss(
                     x_t,
@@ -152,18 +159,23 @@ def sample(
     log_to_wandb: bool,
     wandb_title: str = 'Validation Samples',
     timesteps_to_log: List[int] = [],
+    save_dir: str = None,
     **kwargs
 ):
     model.eval()
     results = []
-    
+
     def _tensors_lists_differ(t1, t2):
         return not all(torch.equal(a, b) for a, b in zip(t1, t2))
 
     # Make sure guidance_scale is a list
     if isinstance(guidance_scale, float):
         guidance_scale = [guidance_scale]
-        
+
+    # Create save directory if saving locally
+    if save_dir is not None:
+        os.makedirs(save_dir, exist_ok=True)
+
     logged_images = []
     x_0_pred_images = []
     for sample_idx in range(n_samples):
@@ -174,7 +186,7 @@ def sample(
         condition = condition_img.unsqueeze(0).to(model.device)      # [1, C, H, W]
         gt_square_img = gt_square_img.unsqueeze(0).to(model.device)  # [1, C, H, W]
         gt_square_img = dataset.to_image(gt_square_img)  # Convert to image format
-        
+
         sample_results = []
         all_x_0 = []
         all_x_0_to_image = []
@@ -192,7 +204,7 @@ def sample(
             sample_results.append(output)
             all_x_0.append(output["x_0"])  # Store raw x_0 tensors
             all_x_0_to_image.append(dataset.to_image(output["x_0"]))  # (B, C, H, W)
-            
+
             all_x_0_prediction.append(output["x_0_traj"])
             all_x_0_prediction_to_image.append(dataset.to_image(output["x_0_traj"]))
         results.append(sample_results)
@@ -202,23 +214,25 @@ def sample(
         if _tensors_lists_differ(all_x_0, all_x_0_to_image):
             preds_to_plot = list(chain.from_iterable(zip(all_x_0, all_x_0_to_image)))
             x_axis_vals = [x for x in guidance_scale for _ in range(2)]
-            
+
+        save_path = os.path.join(save_dir, f"sample_{sample_idx}.png") if save_dir else None
         fig_or_path = plot_condition_vs_images_grid(
             condition_img,
             gt=gt_square_img,
             predictions=preds_to_plot,
             x_axis=x_axis_vals,
             draw_condition_on_pred=True,
-            title=f"Sample={sample_idx}"
+            title=f"Sample={sample_idx}",
+            save_path=save_path,
         )
         if log_to_wandb:
             logged_images.append(wandb.Image(fig_or_path, caption=f"Sample={sample_idx}"))
-            
+
         for i,scale in enumerate(guidance_scale):
             x_0_predictions = all_x_0_prediction[i] # (B, T, C, H, W)
             x_0_predictions_to_image = all_x_0_prediction_to_image[i]  # (B, T, C, H, W)
             # index out timesteps into a list
-            
+
             x_0_predictions = [x_0_predictions[:, scheduler.diffusion_steps -t-1] for t in timesteps_to_log]
             x_0_predictions_to_image = [x_0_predictions_to_image[:, scheduler.diffusion_steps -t-1] for t in timesteps_to_log]
 
@@ -228,7 +242,7 @@ def sample(
                 preds_to_plot = list(chain.from_iterable(zip(x_0_predictions, x_0_predictions_to_image)))
                 x_axis_vals = [x for x in timesteps_to_log for _ in range(2)]
 
-
+            save_path = os.path.join(save_dir, f"x0_pred_cfg{scale}_sample_{sample_idx}.png") if save_dir else None
             fig_or_path = plot_condition_vs_images_grid(
                 condition_img,
                 gt=gt_square_img,
@@ -236,12 +250,13 @@ def sample(
                 x_axis=x_axis_vals,
                 draw_condition_on_pred=True,
                 title=f"x_0 predictions CFG={scale} Sample={sample_idx}",
-                column_prefix="t="
+                column_prefix="t=",
+                save_path=save_path,
             )
             if log_to_wandb:
                 x_0_pred_images.append(wandb.Image(fig_or_path, caption=f"x_0 predictions CFG={scale} Sample={sample_idx}"))
     if log_to_wandb:
-        wandb.log({wandb_title: logged_images})  # single W&B panel with multiple images  
+        wandb.log({wandb_title: logged_images})  # single W&B panel with multiple images
         wandb.log({wandb_title+ " x_0_predictions": x_0_pred_images})  # single W&B panel with multiple images
     return results  # shape: [n_samples][len(guidance_scale)] (each is a dict if return_dict=True)
 
@@ -360,7 +375,7 @@ def train_img_diffusion_model(
 
                 x_t, eps = scheduler.noise(posterior, t)
 
-                with torch.autocast(device_type=device, dtype=dtype_map[autocast_dtype]):
+                with torch.autocast(device_type=device, dtype=_resolve_autocast_dtype(autocast_dtype, device)):
                     if p_null > 0:
                         mask = torch.rand(ellipse_imgs.size(0), device=device) <= p_null
                         noise_pred = torch.empty_like(eps)
@@ -409,6 +424,8 @@ def train_img_diffusion_model(
             
             if (train_step + 1) % train_viz_config['plot_every_n_steps']== 0:
                 image_pixel_space = dataset.to_image(posterior)
+                train_viz_dir = os.path.join(outputs_dir, "train_viz")
+                os.makedirs(train_viz_dir, exist_ok=True)
                 train_fig = plot_training_visualization_grid(
                     ellipse_imgs,
                     square_imgs,
@@ -417,6 +434,7 @@ def train_img_diffusion_model(
                     eps,
                     x_t,
                     t,
+                    save_path=os.path.join(train_viz_dir, f"step_{train_step}.png"),
                     **train_viz_config,
                 )
                 if master_process:
@@ -424,7 +442,10 @@ def train_img_diffusion_model(
                         "Training Viz": wandb.Image(train_fig, caption=f"Train step {train_step}"),
                         },step=train_step)
             train_step+=1
-            torch.cuda.synchronize()  # Ensure all operations are complete before measuring time
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            elif hasattr(torch.mps, 'synchronize'):
+                torch.mps.synchronize()
             t1 = time.time()
             dt = (t1 - t0)
             imgs_per_sec = grad_accum_steps*ellipse_imgs.size(0)*ddp_world_size / dt
@@ -458,12 +479,14 @@ def train_img_diffusion_model(
             
         if master_process and (epoch + 1) % sampling_config['sample_every_n_epochs'] == 0:
             logger.info(f"Sampling images for epoch {epoch + 1}")
+            samples_dir = os.path.join(outputs_dir, "samples", f"epoch_{epoch + 1}")
             sample(
                 model,
                 scheduler,
                 val_dataloader,
                 dataset,
                 wandb_title="Validation Samples",
+                save_dir=os.path.join(samples_dir, "val"),
                 **sampling_config
             )
 
@@ -473,6 +496,7 @@ def train_img_diffusion_model(
                 train_dataloader,
                 dataset,
                 wandb_title="Training Samples",
+                save_dir=os.path.join(samples_dir, "train"),
                 **sampling_config
             )
         if master_process and (epoch + 1) % checkpoint_every_n_epochs == 0:
