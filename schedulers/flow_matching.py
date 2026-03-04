@@ -74,36 +74,9 @@ class FlowMatching:
             else:
                 middle = []
             return head + middle + tail
-        elif sampling_schedule.startswith("first_last"):
-            parts = sampling_schedule.split(":")
-            if len(parts) == 2:
-                first, last = [int(x) for x in parts[1].split(",")]
-            else:
-                first = int(sampling_steps * 0.6)
-                last = sampling_steps - first
-            first = min(first, N)
-            last = min(last, N - first)
-            head = full[:first]
-            tail = full[-last:] if last > 0 else []
-            return head + tail
         elif sampling_schedule == "cosine":
             t = np.linspace(0, np.pi, sampling_steps)
             indices = np.round((1 - np.cos(t)) / 2 * (N - 1)).astype(int)
-            indices = np.unique(np.clip(indices, 0, N - 1))
-            return [full[i] for i in indices]
-        elif sampling_schedule == "cosine_head":
-            t = np.linspace(0, np.pi / 2, sampling_steps)
-            indices = np.round((1 - np.cos(t)) * (N - 1)).astype(int)
-            indices = np.unique(np.clip(indices, 0, N - 1))
-            return [full[i] for i in indices]
-        elif sampling_schedule == "cosine_tail":
-            t = np.linspace(0, np.pi / 2, sampling_steps)
-            indices = np.round(np.sin(t) * (N - 1)).astype(int)
-            indices = np.unique(np.clip(indices, 0, N - 1))
-            return [full[i] for i in indices]
-        elif sampling_schedule == "quadratic":
-            t = np.linspace(0, 1, sampling_steps)
-            indices = np.round(t**2 * (N - 1)).astype(int)
             indices = np.unique(np.clip(indices, 0, N - 1))
             return [full[i] for i in indices]
         else:  # "uniform"

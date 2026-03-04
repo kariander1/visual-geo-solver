@@ -27,12 +27,9 @@ class DDIM:
             sampling_steps: total number of denoising steps (None → use all).
             sampling_schedule: one of
                 "uniform"  – evenly spaced across the full range
-                "first_last:F,L" – keep the first F high-noise steps and last L
-                                   low-noise steps, skip the middle.
+                "first_mid_last:F,M,L" – keep the first F high-noise steps,
+                    M uniformly sampled from the middle, and last L low-noise steps.
                 "cosine"   – cosine-spaced (denser at both ends)
-                "cosine_head" – cosine-spaced, denser at the start (high noise)
-                "cosine_tail" – cosine-spaced, denser at the end (low noise)
-                "quadratic" – quadratic spacing (denser at start)
         Returns:
             List[int] of timesteps in descending order (high → low noise),
             ending at 1 (the final denoise to t=0 is implicit).
@@ -44,14 +41,12 @@ class DDIM:
             return full
 
         if sampling_schedule.startswith("first_mid_last"):
-            # "first_mid_last:F,M,L" – F from start, M uniform from middle, L from end
             parts = sampling_schedule.split(":")
             first, mid, last = [int(x) for x in parts[1].split(",")]
             first = min(first, N)
             last = min(last, N - first)
             head = full[:first]
             tail = full[-last:] if last > 0 else []
-            # middle: uniform sample from the gap between head and tail
             mid_start = first
             mid_end = N - last
             if mid > 0 and mid_end > mid_start:
@@ -60,41 +55,9 @@ class DDIM:
             else:
                 middle = []
             return head + middle + tail
-        elif sampling_schedule.startswith("first_last"):
-            parts = sampling_schedule.split(":")
-            if len(parts) == 2:
-                first, last = [int(x) for x in parts[1].split(",")]
-            else:
-                # Default split: roughly 60/40
-                first = int(sampling_steps * 0.6)
-                last = sampling_steps - first
-            first = min(first, N)
-            last = min(last, N - first)
-            head = full[:first]
-            tail = full[-last:] if last > 0 else []
-            return head + tail
         elif sampling_schedule == "cosine":
-            # Cosine spacing: denser at both ends (0 and pi)
             t = np.linspace(0, np.pi, sampling_steps)
             indices = np.round((1 - np.cos(t)) / 2 * (N - 1)).astype(int)
-            indices = np.unique(np.clip(indices, 0, N - 1))
-            return [full[i] for i in indices]
-        elif sampling_schedule == "cosine_head":
-            # Denser at start (high noise): use first half of cosine curve
-            t = np.linspace(0, np.pi / 2, sampling_steps)
-            indices = np.round((1 - np.cos(t)) * (N - 1)).astype(int)
-            indices = np.unique(np.clip(indices, 0, N - 1))
-            return [full[i] for i in indices]
-        elif sampling_schedule == "cosine_tail":
-            # Denser at end (low noise): mirror of cosine_head
-            t = np.linspace(0, np.pi / 2, sampling_steps)
-            indices = np.round(np.sin(t) * (N - 1)).astype(int)
-            indices = np.unique(np.clip(indices, 0, N - 1))
-            return [full[i] for i in indices]
-        elif sampling_schedule == "quadratic":
-            # Quadratic: denser at start (high noise)
-            t = np.linspace(0, 1, sampling_steps)
-            indices = np.round(t**2 * (N - 1)).astype(int)
             indices = np.unique(np.clip(indices, 0, N - 1))
             return [full[i] for i in indices]
         else:  # "uniform"
