@@ -1,4 +1,4 @@
-# Visual Diffusion Models are Geometric Solvers (CVPR 2026)
+# Visual Diffusion Models are Geometric Solvers (CVPR 2026 Highlight)
 
 > **Nir Goren\*, Shai Yehezkel\*, Omer Dahary, Andrey Voynov, Or Patashnik, Daniel Cohen-Or**
 >
